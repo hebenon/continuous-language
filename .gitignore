@@ -1,0 +1,21 @@
+
+### Jupyter Notebook ###
+.ipynb_checkpoints
+
+### Marimo ###
+__marimo__/
+
+### VirtualEnv ###
+.venv/
+
+### Weights and Biases ###
+wandb/
+
+### Model Checkpoints ###
+checkpoints/
+
+### Letta ###
+.letta/
+
+### Data ###
+data/
