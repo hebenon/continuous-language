@@ -14,6 +14,12 @@ Usage:
 
     # Quick stability check (30 min on A100)
     python train_char_lm.py --model gated_wave --d_model 512 --n_layers 6 --n_scales 4 --steps 5000
+
+    # Language-tuned theta (H9: match theta to English text periodicities)
+    # theta_min=0.063 (period~100 chars, sentence scale)
+    # theta_max=1.257 (period~5 chars, word scale)
+    python train_char_lm.py --model gated_wave --d_model 1024 --n_layers 12 --n_scales 4 \\
+        --theta_min 0.063 --theta_max 1.257 --wandb
 """
 
 import jax
@@ -79,6 +85,8 @@ class CharLM(nn.Module):
     n_layers: int
     n_scales: int
     model_type: str  # "gated_wave" | "mingru"
+    theta_min: float = 0.01
+    theta_max: float = 1.0
 
     @nn.compact
     def __call__(self, x_indices):
@@ -92,6 +100,8 @@ class CharLM(nn.Module):
                 d_model=self.d_model,
                 n_layers=self.n_layers,
                 n_scales=self.n_scales,
+                theta_min=self.theta_min,
+                theta_max=self.theta_max,
             )
         else:
             core = MinGRU(d_model=self.d_model, n_layers=self.n_layers)
@@ -149,6 +159,12 @@ def main():
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--n_layers", type=int, default=6)
     parser.add_argument("--n_scales", type=int, default=4, help="GatedWave only")
+    parser.add_argument("--theta_min", type=float, default=0.01,
+        help="GatedWave: min oscillatory theta (default 0.01 = period~628). "
+             "Language preset: 0.063 (period~100, sentence scale)")
+    parser.add_argument("--theta_max", type=float, default=1.0,
+        help="GatedWave: max oscillatory theta (default 1.0 = period~6.3). "
+             "Language preset: 1.257 (period~5, word scale)")
     parser.add_argument("--seq_len", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -180,6 +196,8 @@ def main():
         n_layers=args.n_layers,
         n_scales=args.n_scales,
         model_type=args.model,
+        theta_min=args.theta_min,
+        theta_max=args.theta_max,
     )
 
     key = jax.random.PRNGKey(args.seed)

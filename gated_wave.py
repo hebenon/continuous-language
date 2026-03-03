@@ -103,21 +103,33 @@ class GatedWaveModel(nn.Module):
     d_model: int = 128
     n_layers: int = 4
     n_scales: int = 2
-    
+    r_min: float = 0.9
+    r_max: float = 0.999
+    theta_min: float = 0.01
+    theta_max: float = 1.0
+
     @nn.compact
     def __call__(self, x):
         x = nn.Dense(self.d_model, name="input_proj")(x)
-        
+
         # Initial conditioning is just the input
         # We repeat it to match the expected d_model * 2 (real + imag)
         prev_h = jnp.concatenate([x, jnp.zeros_like(x)], axis=-1)
-        
+
         for i in range(self.n_layers):
             residual = x
             x = nn.LayerNorm(name=f"ln_{i}")(x)
-            
+
             # Layer output is now d_model * 2 due to real+imag
-            h_complex = GatedWaveDynamicsLayer(d_model=self.d_model, n_scales=self.n_scales, name=f"layer_{i}")(x, conditioning=prev_h)
+            h_complex = GatedWaveDynamicsLayer(
+                d_model=self.d_model,
+                n_scales=self.n_scales,
+                r_min=self.r_min,
+                r_max=self.r_max,
+                theta_min=self.theta_min,
+                theta_max=self.theta_max,
+                name=f"layer_{i}",
+            )(x, conditioning=prev_h)
             
             # For the next layer, use the full complex state
             prev_h = h_complex
