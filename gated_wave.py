@@ -80,13 +80,14 @@ class GatedWaveDynamicsLayer(nn.Module):
             drive_re = nn.Dense(d_this_scale, name=f"drive_re_{i}")(x)
             drive_im = nn.Dense(d_this_scale, name=f"drive_im_{i}")(x)
             b = (drive_re + 1j * drive_im).astype(jnp.complex64)
-            # Normalize input gain. For oscillatory scales (r<1): (1-r) keeps state bounded.
-            # For the integrator scale (r=1): (1-r)=0 would zero the input — use 1/sqrt(d)
-            # instead so the accumulator actually receives a signal.
-            if r >= 1.0:
-                b = b / jnp.sqrt(float(d_this_scale))
-            else:
-                b = b * (1 - r)
+            # Normalize input gain uniformly by 1/sqrt(d).
+            # The original (1-r) normalization was intended to keep state bounded, but it
+            # creates severe gain asymmetry: scale 0 (r=1) gets 1/sqrt(d)≈0.25x while
+            # scale 1 (r=0.999) gets (1-0.999)x = 0.001x — a 250:1 ratio that starves
+            # the oscillatory scales. State boundedness is guaranteed by r<1 decay in a,
+            # not by input normalization, so (1-r) was over-conservative.
+            # All scales now receive equal input gain; LayerNorm on output handles magnitude.
+            b = b / jnp.sqrt(float(d_this_scale))
             
             # 5. Parallel scan with gated input
             b_gated = (1.0 - gate).astype(jnp.complex64) * b
