@@ -10,7 +10,8 @@ Usage:
     python train_char_lm.py --model gated_wave --d_model 1024 --n_layers 12 --n_scales 4 --wandb
 
     # minGRU baseline (matched parameter count)
-    python train_char_lm.py --model mingru --d_model 724 --n_layers 6   # ~same params as wave d=512
+    python train_char_lm.py --model mingru --d_model 900 --n_layers 6   # ~10.7M, matches wave d=512 ~10.2M
+    python train_char_lm.py --model mingru --d_model 1800 --n_layers 12  # ~81.3M, matches wave d=1024 ~79.8M
 
     # Quick stability check (30 min on A100)
     python train_char_lm.py --model gated_wave --d_model 512 --n_layers 6 --n_scales 4 --steps 5000
