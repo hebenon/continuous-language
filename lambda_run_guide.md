@@ -136,6 +136,38 @@ comparison isn't valid.
 4. **Val BPC at convergence** (step 40k-50k) — primary comparison metric
 5. **Early BPC at step 5k** — convergence speed (does wave learn faster early?)
 
+## Post-Run Architecture Analysis (GatedWave Only)
+
+If GatedWave trains successfully, examine gate behavior per scale. This requires a small
+diagnostic script (not in train_char_lm.py) that loads a checkpoint and runs inference
+on a sample, logging gate activation values per scale.
+
+**What to look for: per-scale gate sparsity**
+
+Each GatedWave scale has fully independent gate parameters — scale 0 can fire frequently
+while scales 1-3 fire rarely. A well-functioning architecture should show differential
+gate behavior:
+- Scale 0 (integrator, r=1.0): relatively frequent gate firing — resets at segment boundaries
+- Scales 1-3 (oscillatory, r<1): sparse gate firing — accumulate across boundaries, preserve
+  oscillatory phase between gates
+
+**Why this matters**: If all scales have similar gate firing rates, the multi-scale
+differentiation isn't being learned. The oscillatory scales need to stay "alive" (rarely
+reset) to accumulate periodic signals coherently — the H9 mechanism requires low gate
+frequency on oscillatory scales.
+
+**If gate sparsity is wrong** (oscillatory scales as frequently reset as integrator):
+- The architecture isn't using its multi-scale structure
+- Consider adding a sparsity regularization loss on oscillatory gates
+- Or: decouple gate conditioning — integrator gate conditioned on x, oscillatory gates
+  conditioned on frequency-filtered version of prev_h
+
+**Quick diagnostic** (write post-run):
+```python
+# After loading params from checkpoint, run on ~1000 chars of val data
+# Log: mean(gate) per scale per layer → expect scale 0 > scales 1-3
+```
+
 ---
 
 ## Architecture Status (Pre-Run)
