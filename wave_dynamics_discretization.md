@@ -191,4 +191,16 @@ class WaveDimension:
 
 ---
 
-**Next**: Implement Phase 1 synthetic test. Can write pure Python simulation without ML framework.
+**Phase 1 Test Result (2026-03-14)**: Run against repeating-sum-with-reset (period=6 sawtooth).
+Wave MSE: 1.58–1.78. MinGRU baseline: 1.57. No advantage even with omega = 2π/6 (matched frequency).
+
+**Root cause**: Single wave dimension + linear readout cannot represent a sawtooth (multi-harmonic signal).
+The model latches onto the 2-step input alternation (dominant frequency), not the 6-step target pattern.
+Frequency-matching does not help because the readout needs multiple harmonics to reconstruct the sawtooth.
+
+**Implication**: Phase 1 analytical test is not a valid testbed for wave dynamics advantage.
+The correct testbed is gradient-trained networks on genuinely sinusoidal signals (see H9: +30pp confirmed).
+Phase 1 approach would need either: (a) sinusoidal task matching the wave frequency, or (b) multiple
+wave dimensions with a learned multi-frequency linear combination.
+
+**Next**: Phase 2 JAX integration only if Lambda budget allows; H9 design is the valid analytical baseline.
