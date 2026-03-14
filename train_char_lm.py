@@ -88,6 +88,7 @@ class CharLM(nn.Module):
     model_type: str  # "gated_wave" | "mingru"
     theta_min: float = 0.01
     theta_max: float = 1.0
+    log_theta: bool = False
 
     @nn.compact
     def __call__(self, x_indices):
@@ -103,6 +104,7 @@ class CharLM(nn.Module):
                 n_scales=self.n_scales,
                 theta_min=self.theta_min,
                 theta_max=self.theta_max,
+                log_theta=self.log_theta,
             )
         else:
             core = MinGRU(d_model=self.d_model, n_layers=self.n_layers)
@@ -166,6 +168,8 @@ def main():
     parser.add_argument("--theta_max", type=float, default=1.0,
         help="GatedWave: max oscillatory theta (default 1.0 = period~6.3). "
              "Language preset: 1.257 (period~5, word scale)")
+    parser.add_argument("--log_theta", action="store_true",
+                        help="Use log-spaced theta for GatedWave oscillatory scales (H11)")
     parser.add_argument("--seq_len", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -199,6 +203,7 @@ def main():
         model_type=args.model,
         theta_min=args.theta_min,
         theta_max=args.theta_max,
+        log_theta=args.log_theta,
     )
 
     key = jax.random.PRNGKey(args.seed)
@@ -276,8 +281,11 @@ def main():
                 pickle.dump(params, f)
             print(f"  Checkpoint: {ckpt_path}")
 
-    # Final test eval
-    test_loss = eval_split(model, params, splits["test"], vocab_size,
+    # Final test eval — use best params (not final, which may have overfit)
+    best_params_path = save_dir / "best_params.pkl"
+    with open(best_params_path, "rb") as f:
+        best_params = pickle.load(f)
+    test_loss = eval_split(model, best_params, splits["test"], vocab_size,
                            args.seq_len, args.batch_size, n_batches=100)
     test_bpc_val = bpc(test_loss)
     print(f"\nFinal test BPC: {test_bpc_val:.4f}")
