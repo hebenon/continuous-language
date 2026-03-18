@@ -42,6 +42,7 @@ except ImportError:
     HAS_WANDB = False
 
 from gated_wave import GatedWaveModel
+from hierarchical_wave import HierarchicalWaveModel
 
 # ── minGRU baseline ──────────────────────────────────────────────────────────
 
@@ -85,7 +86,7 @@ class CharLM(nn.Module):
     d_model: int
     n_layers: int
     n_scales: int
-    model_type: str  # "gated_wave" | "mingru"
+    model_type: str  # "gated_wave" | "hierarchical_wave" | "mingru"
     theta_min: float = 0.01
     theta_max: float = 1.0
     log_theta: bool = False
@@ -99,6 +100,15 @@ class CharLM(nn.Module):
 
         if self.model_type == "gated_wave":
             core = GatedWaveModel(
+                d_model=self.d_model,
+                n_layers=self.n_layers,
+                n_scales=self.n_scales,
+                theta_min=self.theta_min,
+                theta_max=self.theta_max,
+                log_theta=self.log_theta,
+            )
+        elif self.model_type == "hierarchical_wave":
+            core = HierarchicalWaveModel(
                 d_model=self.d_model,
                 n_layers=self.n_layers,
                 n_scales=self.n_scales,
@@ -158,7 +168,7 @@ def eval_split(model, params, data, vocab_size, seq_len, batch_size, n_batches=5
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="gated_wave", choices=["gated_wave", "mingru"])
+    parser.add_argument("--model", default="gated_wave", choices=["gated_wave", "hierarchical_wave", "mingru"])
     parser.add_argument("--d_model", type=int, default=512)
     parser.add_argument("--n_layers", type=int, default=6)
     parser.add_argument("--n_scales", type=int, default=4, help="GatedWave only")
@@ -212,7 +222,7 @@ def main():
     n_params = count_params(params)
     print(f"Parameters: {n_params:,}")
     print(f"Model: {args.model} | d={args.d_model} | L={args.n_layers}" +
-          (f" | scales={args.n_scales}" if args.model == "gated_wave" else ""))
+          (f" | scales={args.n_scales}" if args.model in ("gated_wave", "hierarchical_wave") else ""))
 
     # Optimizer with warmup + cosine decay
     schedule = optax.join_schedules([
@@ -227,7 +237,7 @@ def main():
 
     # W&B
     run_name = f"{args.model}_d{args.d_model}_L{args.n_layers}" + \
-               (f"_s{args.n_scales}" if args.model == "gated_wave" else "")
+               (f"_s{args.n_scales}" if args.model in ("gated_wave", "hierarchical_wave") else "")
     if args.wandb and HAS_WANDB:
         wandb.init(
             project=args.wandb_project,
@@ -293,7 +303,7 @@ def main():
 
     results = {
         "model": args.model, "d_model": args.d_model, "n_layers": args.n_layers,
-        "n_scales": args.n_scales if args.model == "gated_wave" else None,
+        "n_scales": args.n_scales if args.model in ("gated_wave", "hierarchical_wave") else None,
         "n_params": n_params, "seq_len": args.seq_len, "steps": args.steps,
         "best_val_bpc": best_val_bpc, "test_bpc": test_bpc_val,
     }

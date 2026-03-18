@@ -45,7 +45,7 @@ python train_char_lm.py --model gated_wave --d_model 512 --n_layers 6 \
 python train_char_lm.py --model gated_wave --d_model 1024 --n_layers 12 \
     --n_scales 4 --steps 50000 --wandb --wandb_project gated-wave-char-lm
 
-# Condition B: GatedWave language-tuned theta
+# Condition B: GatedWave language-tuned theta (linear spacing)
 python train_char_lm.py --model gated_wave --d_model 1024 --n_layers 12 \
     --n_scales 4 --theta_min 0.063 --theta_max 1.257 --steps 50000 \
     --wandb --wandb_project gated-wave-char-lm
@@ -53,7 +53,16 @@ python train_char_lm.py --model gated_wave --d_model 1024 --n_layers 12 \
 # Condition C: minGRU baseline (parameter-matched)
 python train_char_lm.py --model mingru --d_model 1800 --n_layers 12 \
     --steps 50000 --wandb --wandb_project gated-wave-char-lm
+
+# Condition D: GatedWave language-tuned theta (log spacing) — H11 follow-up
+# CONFIRMED on diagnostic task (2026-03-09): log-spacing beats linear by +7pp overall,
+# +13pp on the unmatched middle frequency. log_theta flag now in gated_wave.py.
+python train_char_lm.py --model gated_wave --d_model 1024 --n_layers 12 \
+    --n_scales 4 --theta_min 0.063 --theta_max 1.257 --log_theta --steps 50000 \
+    --wandb --wandb_project gated-wave-char-lm
 ```
+
+Note: `--log_theta` flag is wired through `train_char_lm.py` → `CharLM` → `GatedWaveModel` → `GatedWaveDynamicsLayer` (added 2026-03-09).
 
 ### Small-scale versions (parallel stability check of all three configs)
 
@@ -162,11 +171,67 @@ frequency on oscillatory scales.
 - Or: decouple gate conditioning — integrator gate conditioned on x, oscillatory gates
   conditioned on frequency-filtered version of prev_h
 
-**Quick diagnostic** (write post-run):
-```python
-# After loading params from checkpoint, run on ~1000 chars of val data
-# Log: mean(gate) per scale per layer → expect scale 0 > scales 1-3
+**Quick diagnostic** (script: `gate_sparsity_diagnostic.py`):
+```bash
+# After training completes:
+python gate_sparsity_diagnostic.py \
+    --checkpoint checkpoints/char_lm/best_params.pkl \
+    --n_layers 12 --n_scales 4
+
+# To inspect params tree if key paths differ:
+python gate_sparsity_diagnostic.py \
+    --checkpoint checkpoints/char_lm/best_params.pkl --tree
 ```
+
+---
+
+## Theta Coverage Analysis — English Text Periodicity (added 2026-03-06)
+
+Config A and B cover different period ranges. This predicts when each will outperform the other.
+
+| Theta range | Period range (2π/theta) | Text structure at this scale |
+|-------------|------------------------|------------------------------|
+| 0.010–0.021 | 300–628 chars | **Paragraph** (~300-600 chars avg) |
+| 0.052–0.126 | 50–120 chars | **Sentence** (~70-80 chars avg) |
+| 0.25–0.42 | 15–25 chars | **Phrase** (noun phrase, short clause) |
+| 0.785–2.09 | 3–8 chars | **Word** (~5 chars avg English) |
+
+**Config A** (theta 0.01→1.0): covers word→paragraph scale (period 6–628 chars).
+**Config B** (theta 0.063→1.257): covers word→sentence scale (period 5–100 chars). **Missing: paragraph scale.**
+
+**Prediction for Pattern 5 (Config A > Config B):**
+Config A beats Config B when paragraph-level structure provides useful signal. TinyShakespeare
+has clear paragraph-scale periodicity: verse structure, speech/response exchange cycles (~200-500
+chars), act/scene rhythm. If the oscillatory mechanism is helping by tracking these, Config A's
+slow oscillators (theta ~0.01-0.02) would contribute and Config B would miss them.
+
+**Alternative: if Config B > Config A**
+The word-to-sentence scale (Config B's concentrated range) is the main bottleneck for char-LM.
+The slow oscillators in Config A (theta 0.01-0.05) may be wasted capacity at the character scale,
+possibly harming optimization by adding noise to the gradient from underused scales.
+
+**On the mechanism: resonance vs. gradient flow**
+H9 confirmed theta-period matching for *exact sinusoidal signals*. Natural language doesn't have
+exact periodicity — it has hierarchical, contextual structure. The char-LM benefit of theta
+diversity may come from:
+(a) **Resonance** (H9 direct): oscillators literally track recurring patterns at their period
+(b) **Credit assignment** (indirect): diverse timescales provide better gradient paths for
+    different-length dependencies, even without exact period matching
+
+If (a): Config B wins by concentrating capacity on the most periodic language scales (word/sentence)
+If (b): either config may work, but Config A's broader coverage hedges against unknown periodicity
+
+**TinyShakespeare note:**
+Small corpus (1.1M chars). Dramatic text with strong verse/prose rhythm, dialogue exchange,
+soliloquy structure. Possibly more periodic at sentence scale than prosaic text. Config B
+may have a slight advantage for this specific corpus, but a more varied corpus would favor
+Config A's broader coverage.
+
+**Implication for Config D (H11 — log-spaced theta):**
+Log-spaced theta over 0.063→1.257 gives: 0.063 / 0.19 / 0.56 / 1.26 (sentence/clause/phrase/word).
+Linear gives: 0.063 / 0.46 / 0.86 / 1.26 (3 scales at word/phrase, 1 at sentence).
+Log spacing distributes scales more evenly in period-space, covering sentence-to-word more uniformly.
+But Config D still misses paragraph scale. If Config A > Config B, Config D likely also < Config A.
 
 ---
 
@@ -211,4 +276,4 @@ is what this run will tell us.
 
 ---
 
-*Last updated: 2026-03-04. Architecture: both bugs fixed. Three configs ready.*
+*Last updated: 2026-03-09. Architecture: both bugs fixed. Four configs ready (D added after H11 confirmation).*

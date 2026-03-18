@@ -2,11 +2,12 @@
 Hierarchical minGRU in JAX/Flax for Path-X experiments.
 
 Based on "Were RNNs All We Needed?" (Feng et al., Oct 2024)
-Extended with timescale-separated compartments.
+Extended with timescale-separated compartments and wave dynamics.
 
 Usage:
     python train_minGRU.py --task path32 --model vanilla --wandb
-    python train_minGRU.py --task path32 --model hierarchical --wandb
+    python train_minGRU.py --task path32 --model multiscale --wandb
+    python train_minGRU.py --task path32 --model wave --wandb
 """
 
 import jax
@@ -145,95 +146,191 @@ class MinGRU(nn.Module):
         
         return x
 
-# === Hierarchical minGRU ===
 
-class HierarchicalMinGRULayer(nn.Module):
-    """Single hierarchical minGRU layer with fast/slow compartments."""
+# === Multi-Scale minGRU (Generalized) ===
+
+class MultiScaleMinGRULayer(nn.Module):
+    """Generalized multi-timescale minGRU layer with N timescale buckets."""
     
-    d_fast: int = 64
-    d_slow: int = 64
-    z_bias_fast: float = 2.0
-    z_bias_slow: float = -2.0
+    d_model: int = 128
+    n_scales: int = 2
+    z_bias_min: float = -2.0  # slowest (long memory)
+    z_bias_max: float = 2.0   # fastest (short memory)
     coupling: str = "output"
     
     @nn.compact
     def __call__(self, x):
         batch, seq_len, d_in = x.shape
         
-        # === Fast compartment ===
-        z_fast_pre = nn.Dense(
-            self.d_fast,
-            name="z_fast",
-            bias_init=nn.initializers.constant(self.z_bias_fast)
-        )(x)
-        h_tilde_fast = nn.Dense(self.d_fast, name="h_fast")(x)
+        # Distribute dimensions across timescale buckets
+        d_per_scale = self.d_model // self.n_scales
+        remainder = self.d_model % self.n_scales
         
-        z_fast = nn.sigmoid(z_fast_pre)
-        a_fast = 1 - z_fast
-        b_fast = z_fast * h_tilde_fast
-        
-        h_fast = parallel_scan(a_fast, b_fast)
-        
-        # === Slow compartment ===
-        if self.coupling == "input":
-            h_fast_shifted = jnp.concatenate([
-                jnp.zeros((batch, 1, self.d_fast)),
-                h_fast[:, :-1, :]
-            ], axis=1)
-            x_slow = jnp.concatenate([x, h_fast_shifted], axis=-1)
+        # Generate z_bias values: evenly spaced from slow to fast
+        if self.n_scales == 1:
+            z_biases = [0.0]  # neutral
         else:
-            x_slow = x
+            z_biases = np.linspace(self.z_bias_min, self.z_bias_max, self.n_scales)
         
-        z_slow_pre = nn.Dense(
-            self.d_slow,
-            name="z_slow",
-            bias_init=nn.initializers.constant(self.z_bias_slow)
-        )(x_slow)
-        h_tilde_slow = nn.Dense(self.d_slow, name="h_slow")(x_slow)
+        h_scales = []
+        for i in range(self.n_scales):
+            # Last bucket gets remainder dimensions
+            d_this_scale = d_per_scale + (remainder if i == self.n_scales - 1 else 0)
+            
+            z_pre = nn.Dense(
+                d_this_scale,
+                name=f"z_scale_{i}",
+                bias_init=nn.initializers.constant(float(z_biases[i]))
+            )(x)
+            h_tilde = nn.Dense(d_this_scale, name=f"h_scale_{i}")(x)
+            
+            z = nn.sigmoid(z_pre)
+            a = 1 - z
+            b = z * h_tilde
+            
+            h_scales.append(parallel_scan(a, b))
         
-        z_slow = nn.sigmoid(z_slow_pre)
-        a_slow = 1 - z_slow
-        b_slow = z_slow * h_tilde_slow
-        
-        h_slow = parallel_scan(a_slow, b_slow)
-        
-        # === Combine ===
-        h_combined = jnp.concatenate([h_fast, h_slow], axis=-1)
+        # Concatenate all timescales
+        h_combined = jnp.concatenate(h_scales, axis=-1)
         
         if self.coupling == "output":
-            gate = nn.sigmoid(nn.Dense(self.d_fast + self.d_slow, name="output_gate")(h_combined))
+            gate = nn.sigmoid(nn.Dense(self.d_model, name="output_gate")(h_combined))
             h_combined = gate * h_combined
         
         return h_combined
 
 
-class HierarchicalMinGRU(nn.Module):
-    """Stacked hierarchical minGRU with layer norm and residuals."""
+class MultiScaleMinGRU(nn.Module):
+    """Stacked multi-scale minGRU with layer norm and residuals."""
     
-    d_fast: int = 64
-    d_slow: int = 64
-    z_bias_fast: float = 2.0
-    z_bias_slow: float = -2.0
+    d_model: int = 128
+    n_scales: int = 2
+    z_bias_min: float = -2.0
+    z_bias_max: float = 2.0
     coupling: str = "output"
     n_layers: int = 4
     
     @nn.compact
     def __call__(self, x):
-        d_model = self.d_fast + self.d_slow
-        
         # Project input to model dimension
-        x = nn.Dense(d_model, name="input_proj")(x)
+        x = nn.Dense(self.d_model, name="input_proj")(x)
         
         for i in range(self.n_layers):
             residual = x
             x = nn.LayerNorm(name=f"ln_{i}")(x)
-            x = HierarchicalMinGRULayer(
-                d_fast=self.d_fast,
-                d_slow=self.d_slow,
-                z_bias_fast=self.z_bias_fast,
-                z_bias_slow=self.z_bias_slow,
+            x = MultiScaleMinGRULayer(
+                d_model=self.d_model,
+                n_scales=self.n_scales,
+                z_bias_min=self.z_bias_min,
+                z_bias_max=self.z_bias_max,
                 coupling=self.coupling,
                 name=f"layer_{i}"
+            )(x)
+            x = x + residual
+        
+        return x
+
+
+# === Wave Dynamics (Coupled Harmonic Oscillators) ===
+
+class WaveDynamicsLayer(nn.Module):
+    """Damped harmonic oscillator layer using complex-valued parallel scan.
+    
+    Each dimension is a discrete damped oscillator:
+        s_t = a * s_{t-1} + b_t
+    where a = r * exp(i*theta) is a complex decay-rotation coefficient.
+    
+    - r ∈ (0, 1): decay rate (controls memory length)
+    - θ ∈ (0, π): oscillation frequency
+    - b_t: input-dependent complex driving force
+    
+    Dimensions are split across n_scales oscillator groups, each with
+    different (r, θ) pairs — from slow/long-memory to fast/short-memory.
+    
+    The existing parallel_scan (associative scan) works unchanged with
+    complex dtypes since the binary operator uses element-wise multiply.
+    """
+    
+    d_model: int = 128
+    n_scales: int = 2
+    r_min: float = 0.9      # fastest decay (shortest memory)
+    r_max: float = 0.999    # slowest decay (longest memory)
+    theta_min: float = 0.01  # slowest oscillation
+    theta_max: float = 1.0   # fastest oscillation (< π for Nyquist)
+    
+    @nn.compact
+    def __call__(self, x):
+        batch, seq_len, d_in = x.shape
+        
+        d_per_scale = self.d_model // self.n_scales
+        remainder = self.d_model % self.n_scales
+        
+        # Fixed (r, θ) per scale: linspace from long-memory/slow to short-memory/fast
+        if self.n_scales == 1:
+            r_values = [(self.r_min + self.r_max) / 2]
+            theta_values = [(self.theta_min + self.theta_max) / 2]
+        else:
+            r_values = np.linspace(self.r_max, self.r_min, self.n_scales)  # long → short
+            theta_values = np.linspace(self.theta_min, self.theta_max, self.n_scales)
+        
+        h_scales = []
+        for i in range(self.n_scales):
+            d_this_scale = d_per_scale + (remainder if i == self.n_scales - 1 else 0)
+            
+            r = float(r_values[i])
+            theta = float(theta_values[i])
+            
+            # Complex decay-rotation coefficient (fixed per scale, broadcast across seq)
+            a_complex = r * jnp.exp(1j * theta)
+            a = jnp.full((batch, seq_len, d_this_scale), a_complex, dtype=jnp.complex64)
+            
+            # Input-dependent driving force: project to real + imag components
+            drive_re = nn.Dense(d_this_scale, name=f"drive_re_{i}")(x)
+            drive_im = nn.Dense(d_this_scale, name=f"drive_im_{i}")(x)
+            b = (drive_re + 1j * drive_im).astype(jnp.complex64)
+            # Scale drive by (1 - r) to normalize: when r≈1, drive should be small
+            b = b * (1 - r)
+            
+            # Parallel scan (reuses existing infrastructure — works with complex)
+            state = parallel_scan(a, b)  # (batch, seq, d_this_scale), complex64
+            
+            # Extract real part (position); imaginary part is velocity
+            h_real = state.real  # (batch, seq, d_this_scale)
+            h_scales.append(h_real)
+        
+        h_combined = jnp.concatenate(h_scales, axis=-1)
+        
+        # Output gate (learnable mixing)
+        gate = nn.sigmoid(nn.Dense(self.d_model, name="output_gate")(h_combined))
+        return gate * h_combined
+
+
+class WaveDynamicsMinGRU(nn.Module):
+    """Stacked wave dynamics layers with layer norm and residuals."""
+    
+    d_model: int = 128
+    n_scales: int = 2
+    r_min: float = 0.9
+    r_max: float = 0.999
+    theta_min: float = 0.01
+    theta_max: float = 1.0
+    n_layers: int = 4
+    
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.d_model, name="input_proj")(x)
+        
+        for i in range(self.n_layers):
+            residual = x
+            x = nn.LayerNorm(name=f"ln_{i}")(x)
+            x = WaveDynamicsLayer(
+                d_model=self.d_model,
+                n_scales=self.n_scales,
+                r_min=self.r_min,
+                r_max=self.r_max,
+                theta_min=self.theta_min,
+                theta_max=self.theta_max,
+                name=f"layer_{i}",
             )(x)
             x = x + residual
         
@@ -247,31 +344,43 @@ class MinGRUClassifier(nn.Module):
     
     num_classes: int = 2
     d_model: int = 128
-    model_type: Literal["vanilla", "hierarchical"] = "vanilla"
-    # Hierarchical params
-    d_fast: int = 64
-    d_slow: int = 64
-    z_bias_fast: float = 2.0
-    z_bias_slow: float = -2.0
-    coupling: Literal["none", "output", "input"] = "output"
-    dropout_rate: float = 0.1
+    model_type: str = "vanilla"  # "vanilla", "multiscale", or "wave"
     n_layers: int = 4
+    # Multi-scale params
+    n_scales: int = 2
+    z_bias_min: float = -2.0
+    z_bias_max: float = 2.0
+    coupling: str = "output"
+    # Wave dynamics params
+    r_min: float = 0.9
+    r_max: float = 0.999
+    theta_min: float = 0.01
+    theta_max: float = 1.0
+    dropout_rate: float = 0.1
     
     @nn.compact
     def __call__(self, x, training=True):
         if self.model_type == "vanilla":
             h = MinGRU(d_model=self.d_model, n_layers=self.n_layers)(x)
-            d_out = self.d_model
-        else:
-            h = HierarchicalMinGRU(
-                d_fast=self.d_fast,
-                d_slow=self.d_slow,
-                z_bias_fast=self.z_bias_fast,
-                z_bias_slow=self.z_bias_slow,
+        elif self.model_type == "wave":
+            h = WaveDynamicsMinGRU(
+                d_model=self.d_model,
+                n_scales=self.n_scales,
+                r_min=self.r_min,
+                r_max=self.r_max,
+                theta_min=self.theta_min,
+                theta_max=self.theta_max,
+                n_layers=self.n_layers,
+            )(x)
+        else:  # "multiscale" (or "hierarchical" for backwards compat)
+            h = MultiScaleMinGRU(
+                d_model=self.d_model,
+                n_scales=self.n_scales,
+                z_bias_min=self.z_bias_min,
+                z_bias_max=self.z_bias_max,
                 coupling=self.coupling,
                 n_layers=self.n_layers,
             )(x)
-            d_out = self.d_fast + self.d_slow
         
         # Take final hidden state
         h_final = h[:, -1, :]
@@ -279,7 +388,7 @@ class MinGRUClassifier(nn.Module):
         # Classification head
         h_final = nn.LayerNorm()(h_final)
         h_final = nn.Dropout(rate=self.dropout_rate, deterministic=not training)(h_final)
-        h_final = nn.Dense(d_out)(h_final)
+        h_final = nn.Dense(self.d_model)(h_final)
         h_final = nn.gelu(h_final)
         h_final = nn.Dropout(rate=self.dropout_rate, deterministic=not training)(h_final)
         
@@ -293,15 +402,20 @@ class TrainConfig:
     task: str = "path32"
     
     # Model
-    model_type: str = "vanilla"  # "vanilla" or "hierarchical"
-    d_model: int = 128  # for vanilla
-    d_fast: int = 64    # for hierarchical
-    d_slow: int = 64
-    z_bias_fast: float = 2.0
-    z_bias_slow: float = -2.0
-    coupling: str = "output"  # "none", "output", "input"
-    dropout_rate: float = 0.1
+    model_type: str = "vanilla"  # "vanilla", "multiscale", or "wave"
+    d_model: int = 128
     n_layers: int = 4
+    # Multi-scale params
+    n_scales: int = 2
+    z_bias_min: float = -2.0
+    z_bias_max: float = 2.0
+    coupling: str = "output"
+    # Wave dynamics params
+    r_min: float = 0.9
+    r_max: float = 0.999
+    theta_min: float = 0.01
+    theta_max: float = 1.0
+    dropout_rate: float = 0.1
     
     # Training
     batch_size: int = 32
@@ -352,7 +466,12 @@ class WandbLogger:
         self.enabled = config.use_wandb and HAS_WANDB
         
         if self.enabled:
-            run_name = config.run_name or f"{config.task}_{config.model_type}_d{config.d_model if config.model_type == 'vanilla' else config.d_fast}"
+            if config.model_type == "vanilla":
+                run_name = config.run_name or f"{config.task}_vanilla_d{config.d_model}"
+            elif config.model_type == "wave":
+                run_name = config.run_name or f"{config.task}_wave_d{config.d_model}_s{config.n_scales}_r{config.r_min}-{config.r_max}"
+            else:
+                run_name = config.run_name or f"{config.task}_ms_d{config.d_model}_s{config.n_scales}_z{abs(config.z_bias_min):.0f}"
             wandb.init(
                 project=config.wandb_project,
                 entity=config.wandb_entity,
@@ -436,44 +555,70 @@ def load_from_huggingface(task: str, split: str, cache_dir: str) -> Tuple[np.nda
     return images, labels
 
 
-def load_from_local(data_dir: str, task: str, split: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Load pathfinder data from local files."""
+def load_pathfinder_memmap(data_dir: Path, split: str, size: int):
+    """Load pathfinder data from memmap files."""
+    path = data_dir / f"pathfinder{size}"
     
-    task_config = TASK_CONFIGS[task]
-    image_size = task_config["image_size"]
-    seq_len = task_config["seq_len"]
+    # Load metadata to get shapes
+    meta = np.load(path / f"{split}_meta.npy", allow_pickle=True).item()
+    
+    images = np.memmap(
+        path / f"{split}_images.npy",
+        dtype=np.float32, mode='r', shape=meta['image_shape']
+    )
+    labels = np.memmap(
+        path / f"{split}_labels.npy", 
+        dtype=np.int32, mode='r', shape=meta['label_shape']
+    )
+    
+    return images, labels
+
+
+def load_from_local(data_dir: str, task: str, split: str):
+    """Load data from local files (memmap or npz format)."""
     data_path = Path(data_dir)
+    task_config = TASK_CONFIGS[task]
+    image_size = task_config.get("image_size", 32)
     
-    # Try various path patterns
+    # Try memmap format first (for large datasets)
+    memmap_dir = data_path / f"pathfinder{image_size}"
+    meta_file = memmap_dir / f"{split}_meta.npy"
+    
+    if meta_file.exists():
+        print(f"Loading {split} from memmap files...")
+        meta = np.load(meta_file, allow_pickle=True).item()
+        
+        images = np.memmap(
+            memmap_dir / f"{split}_images.npy",
+            dtype=np.float32, mode='r', shape=meta['image_shape']
+        )
+        labels = np.memmap(
+            memmap_dir / f"{split}_labels.npy",
+            dtype=np.int32, mode='r', shape=meta['label_shape']
+        )
+        # Add channel dimension: (batch, seq) -> (batch, seq, 1)
+        images = images[:, :, np.newaxis]
+        return images, labels
+    
+    # Fall back to npz format
     patterns = [
-        data_path / f"pathfinder{image_size}_{split}.npz",
-        data_path / task / f"{split}.npz",
-        data_path / f"lra_release/pathfinder{image_size}" / f"{split}.npz",
         data_path / f"pathfinder{image_size}" / f"{split}.npz",
+        data_path / f"lra_release/pathfinder{image_size}" / f"{split}.npz",
+        data_path / task / f"{split}.npz",
     ]
     
-    for npz_file in patterns:
-        if npz_file.exists():
-            data = np.load(npz_file)
-            
-            # Handle different key names
-            image_key = next((k for k in ['images', 'image', 'x', 'inputs'] if k in data), None)
-            label_key = next((k for k in ['labels', 'label', 'y', 'targets'] if k in data), None)
-            
-            if image_key and label_key:
-                images = data[image_key].astype(np.float32)
-                labels = data[label_key].astype(np.int32)
-                
-                if images.max() > 1.0:
-                    images = images / 255.0
-                if len(images.shape) == 3:
-                    images = images.reshape(-1, seq_len)
+    for pattern in patterns:
+        if pattern.exists():
+            print(f"Loading {split} from {pattern}")
+            data = np.load(pattern)
+            images = data['images']
+            # Add channel dimension if needed
+            if len(images.shape) == 2:
                 images = images[:, :, np.newaxis]
-                
-                print(f"Loaded {split}: {len(images)} samples from {npz_file}")
-                return images, labels
+            return images, data['labels']
     
-    raise FileNotFoundError(f"No local data found for {task}/{split}. Tried: {patterns}")
+    raise FileNotFoundError(f"No data found for {task}/{split}. Tried:\n  " + 
+                            "\n  ".join(str(p) for p in [meta_file] + patterns))
 
 
 def create_synthetic_data(num_samples: int, seq_len: int, seed: int = 42):
@@ -540,11 +685,15 @@ def create_train_state(rng, config: TrainConfig, steps_per_epoch: int):
     model = MinGRUClassifier(
         model_type=config.model_type,
         d_model=config.d_model,
-        d_fast=config.d_fast,
-        d_slow=config.d_slow,
-        z_bias_fast=config.z_bias_fast,
-        z_bias_slow=config.z_bias_slow,
+        n_layers=config.n_layers,
+        n_scales=config.n_scales,
+        z_bias_min=config.z_bias_min,
+        z_bias_max=config.z_bias_max,
         coupling=config.coupling,
+        r_min=config.r_min,
+        r_max=config.r_max,
+        theta_min=config.theta_min,
+        theta_max=config.theta_max,
         dropout_rate=config.dropout_rate,
     )
     
@@ -612,12 +761,18 @@ def train(config: TrainConfig) -> Dict[str, Any]:
     print(f"\n{'='*60}")
     print(f"Task: {config.task} ({TASK_CONFIGS[config.task]['description']})")
     print(f"Model: {config.model_type}")
-    if config.model_type == "hierarchical":
-        print(f"  d_fast={config.d_fast}, d_slow={config.d_slow}")
-        print(f"  z_bias_fast={config.z_bias_fast}, z_bias_slow={config.z_bias_slow}")
+    print(f"  d_model={config.d_model}")
+    print(f"  n_layers={config.n_layers}")
+    if config.model_type in ("multiscale", "hierarchical"):
+        print(f"  n_scales={config.n_scales}")
+        print(f"  z_bias_range=[{config.z_bias_min}, {config.z_bias_max}]")
         print(f"  coupling={config.coupling}")
-    else:
-        print(f"  d_model={config.d_model}")
+        # Show actual timescale distribution
+        if config.n_scales > 1:
+            import numpy as np
+            biases = np.linspace(config.z_bias_min, config.z_bias_max, config.n_scales)
+            gates = 1 / (1 + np.exp(-biases))  # sigmoid
+            print(f"  timescales: {['%.0f%%' % (g*100) for g in gates]} new info/step")
     print(f"Sequence length: {config.seq_len}")
     print(f"{'='*60}\n")
     
@@ -787,13 +942,21 @@ if __name__ == "__main__":
     
     # Task & Model
     parser.add_argument("--task", type=str, default="path32", choices=["path32", "path64", "pathx"])
-    parser.add_argument("--model", type=str, default="vanilla", choices=["vanilla", "hierarchical"])
+    parser.add_argument("--model", type=str, default="vanilla", choices=["vanilla", "multiscale", "hierarchical", "wave"])
+    parser.add_argument("--n_scales", type=int, default=2, help="Number of timescale buckets")
+    parser.add_argument("--z_bias_min", type=float, default=-2.0, help="Slowest timescale bias")
+    parser.add_argument("--z_bias_max", type=float, default=2.0, help="Fastest timescale bias")
     parser.add_argument("--d_model", type=int, default=128, help="Hidden dim for vanilla")
-    parser.add_argument("--d_fast", type=int, default=64)
-    parser.add_argument("--d_slow", type=int, default=64)
-    parser.add_argument("--z_bias_fast", type=float, default=2.0)
-    parser.add_argument("--z_bias_slow", type=float, default=-2.0)
+    #parser.add_argument("--d_fast", type=int, default=64)
+    #parser.add_argument("--d_slow", type=int, default=64)
+    #parser.add_argument("--z_bias_fast", type=float, default=2.0)
+    #parser.add_argument("--z_bias_slow", type=float, default=-2.0)
     parser.add_argument("--coupling", type=str, default="output", choices=["none", "output", "input"])
+    # Wave dynamics params
+    parser.add_argument("--r_min", type=float, default=0.9, help="Fastest decay (shortest memory)")
+    parser.add_argument("--r_max", type=float, default=0.999, help="Slowest decay (longest memory)")
+    parser.add_argument("--theta_min", type=float, default=0.01, help="Slowest oscillation frequency")
+    parser.add_argument("--theta_max", type=float, default=1.0, help="Fastest oscillation frequency")
     parser.add_argument("--n_layers", type=int, default=4)
     
     # Training
@@ -812,15 +975,20 @@ if __name__ == "__main__":
     
     test_parallel_scan()
 
+    model_type = args.model if args.model != "hierarchical" else "multiscale"
+
     config = TrainConfig(
         task=args.task,
-        model_type=args.model,
+        model_type=model_type,
+        n_scales=args.n_scales,
+        z_bias_min=args.z_bias_min,
+        z_bias_max=args.z_bias_max,
         d_model=args.d_model,
-        d_fast=args.d_fast,
-        d_slow=args.d_slow,
-        z_bias_fast=args.z_bias_fast,
-        z_bias_slow=args.z_bias_slow,
         coupling=args.coupling,
+        r_min=args.r_min,
+        r_max=args.r_max,
+        theta_min=args.theta_min,
+        theta_max=args.theta_max,
         n_layers=args.n_layers,
         epochs=args.epochs,
         batch_size=args.batch_size,

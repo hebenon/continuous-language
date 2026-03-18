@@ -35,25 +35,30 @@ class GatedWaveDynamicsLayer(nn.Module):
     r_max: float = 0.999
     theta_min: float = 0.01
     theta_max: float = 1.0
-    
+    log_theta: bool = False
+
     @nn.compact
     def __call__(self, x, conditioning=None):
         batch, seq_len, d_in = x.shape
-        
+
         # If no conditioning provided, use x itself
         if conditioning is None:
             conditioning = x
-            
+
         d_per_scale = self.d_model // self.n_scales
         remainder = self.d_model % self.n_scales
-        
+
         if self.n_scales == 1:
             r_values = [(self.r_min + self.r_max) / 2]
             theta_values = [(self.theta_min + self.theta_max) / 2]
         else:
             # Scale 0 is always a pure integrator (long-term memory / accumulator)
             r_values = [1.0] + list(np.linspace(self.r_max, self.r_min, self.n_scales - 1))
-            theta_values = [0.0] + list(np.linspace(self.theta_min, self.theta_max, self.n_scales - 1))
+            if self.log_theta:
+                osc_thetas = np.exp(np.linspace(np.log(self.theta_min), np.log(self.theta_max), self.n_scales - 1))
+            else:
+                osc_thetas = np.linspace(self.theta_min, self.theta_max, self.n_scales - 1)
+            theta_values = [0.0] + list(osc_thetas)
         
         h_scales = []
         for i in range(self.n_scales):
@@ -107,6 +112,7 @@ class GatedWaveModel(nn.Module):
     r_max: float = 0.999
     theta_min: float = 0.01
     theta_max: float = 1.0
+    log_theta: bool = False
 
     @nn.compact
     def __call__(self, x):
@@ -128,6 +134,7 @@ class GatedWaveModel(nn.Module):
                 r_max=self.r_max,
                 theta_min=self.theta_min,
                 theta_max=self.theta_max,
+                log_theta=self.log_theta,
                 name=f"layer_{i}",
             )(x, conditioning=prev_h)
             
