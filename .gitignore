@@ -19,3 +19,12 @@ checkpoints/
 
 ### Data ###
 data/
+
+### Logs ###
+*.log
+
+### Patches ###
+*.patch
+
+### Alt VirtualEnvs ###
+.venv-rd/
